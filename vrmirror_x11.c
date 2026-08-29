@@ -32,11 +32,15 @@
 #include <glib-unix.h>
 #include <libxapp/xapp-status-icon.h>
 #include "vrpresent.h"
+#include "vrhead.h"
 
 /* -------------------------- engine state (single process) --------------- */
 static int         g_drmfd  = -1;      /* leased DRM fd; owned here, borrowed by presenter */
 static vr_present *g_present = NULL;    /* shared scanout/compositor (vrpresent.c) */
 static guint       g_drm_src = 0;       /* GLib watch that reaps flip-complete events */
+static vr_head    *g_head = NULL;       /* headset gyro -> per-eye offset (vrhead.c) */
+static guint       g_head_src = 0;      /* GLib watch that drains IMU packets */
+static int         g_base_xoff = 0, g_base_yoff = 0;  /* static centring offset (head adds to it) */
 
 static xcb_connection_t *g_xcb = NULL;
 static xcb_randr_lease_t g_lease = 0;
@@ -112,10 +116,9 @@ static gboolean drm_cb(GIOChannel *ch, GIOCondition c, gpointer u){
 /* apply the shared VRMIRROR_* presentation knobs (same env as the Wayland frontend) */
 static void apply_present_env(void){
     if(!g_present) return;
-    if(getenv("VRMIRROR_XOFF")||getenv("VRMIRROR_YOFF"))
-        vr_present_set_offset(g_present,
-            getenv("VRMIRROR_XOFF")?atoi(getenv("VRMIRROR_XOFF")):0,
-            getenv("VRMIRROR_YOFF")?atoi(getenv("VRMIRROR_YOFF")):0);
+    g_base_xoff = getenv("VRMIRROR_XOFF")?atoi(getenv("VRMIRROR_XOFF")):0;
+    g_base_yoff = getenv("VRMIRROR_YOFF")?atoi(getenv("VRMIRROR_YOFF")):0;
+    vr_present_set_offset(g_present, g_base_xoff, g_base_yoff);
     vr_present_set_fit(g_present,
         getenv("VRMIRROR_FIT")?VR_FIT_LETTERBOX:VR_FIT_COVER,
         getenv("VRMIRROR_ZOOM")?atof(getenv("VRMIRROR_ZOOM")):1.0);
@@ -212,9 +215,20 @@ static void set_target(Window w){
 }
 
 /* ------------------------------- UI glue -------------------------------- */
+/* drain IMU packets whenever the hidraw fd is readable (advances head angle) */
+static gboolean head_cb(GIOChannel *ch, GIOCondition c, gpointer u){
+    (void)ch;(void)c;(void)u;
+    if(g_head) vr_head_poll(g_head);
+    return G_SOURCE_CONTINUE;
+}
 static guint g_frame_src = 0;
 static gboolean frame_cb(gpointer u){ (void)u;
-    if(g_present&&g_target&&!vr_present_flip_pending(g_present)) present_target();
+    if(g_present&&g_target&&!vr_present_flip_pending(g_present)){
+        if(g_head){ int rx,ry; vr_present_pan_range(g_present,&rx,&ry); vr_head_set_range(g_head,rx,ry);
+            int hx,hy; vr_head_offset(g_head,&hx,&hy);
+            vr_present_set_offset(g_present, g_base_xoff+hx, g_base_yoff+hy); }
+        present_target();
+    }
     return G_SOURCE_CONTINUE; }
 static void icon_state(void){
     const char *ic = !lease_on() ? "video-display-symbolic"
@@ -232,6 +246,11 @@ static int ensure_enabled(void){
     GIOChannel *ch=g_io_channel_unix_new(vr_present_fd(g_present));   /* reap flip events */
     g_drm_src=g_io_add_watch(ch,G_IO_IN,drm_cb,NULL);
     g_io_channel_unref(ch);
+    if(!g_head){                                                     /* headset gyro (optional) */
+        g_head=vr_head_open(NULL);
+        if(g_head){ GIOChannel *hc=g_io_channel_unix_new(vr_head_fd(g_head));
+            g_head_src=g_io_add_watch(hc,G_IO_IN,head_cb,NULL); g_io_channel_unref(hc); }
+    }
     if(!g_frame_src) g_frame_src=g_timeout_add(16,frame_cb,NULL);   /* ~60fps */
     icon_state(); return 0;
 }
@@ -240,6 +259,8 @@ static void do_enable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
 static void do_disable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     g_target=0; if(g_pix){XFreePixmap(g_dpy,g_pix);g_pix=0;}
     if(g_drm_src){ g_source_remove(g_drm_src); g_drm_src=0; }
+    if(g_head_src){ g_source_remove(g_head_src); g_head_src=0; }
+    if(g_head){ vr_head_close(g_head); g_head=NULL; }
     if(g_present){ vr_present_destroy(g_present); g_present=NULL; }
     if(g_drmfd>=0) lease_release();
     if(g_frame_src){ g_source_remove(g_frame_src); g_frame_src=0; }
@@ -303,6 +324,8 @@ int main(int argc,char**argv){
     g_target=0; if(g_pix) XFreePixmap(g_dpy,g_pix);
     if(g_frame_src) g_source_remove(g_frame_src);
     if(g_drm_src) g_source_remove(g_drm_src);
+    if(g_head_src) g_source_remove(g_head_src);
+    if(g_head){ vr_head_close(g_head); g_head=NULL; }
     if(g_present){ vr_present_destroy(g_present); g_present=NULL; }
     if(g_drmfd>=0) lease_release();
     XCloseDisplay(g_dpy);

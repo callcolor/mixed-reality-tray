@@ -38,6 +38,10 @@ struct vr_present {
     uint32_t P_fb,P_pcrtc,P_sx,P_sy,P_sw,P_sh,P_cx,P_cy,P_cw,P_ch,P_mode,P_active,P_conn_crtc;
     /* presentation controls */
     int fit; double zoom; int xoff, yoff; int stereo_force;
+    /* per-axis head-tracking reach (px each way) from the last scaled frame: the
+     * shift that brings a content edge to the viewport centre (= half the scaled
+     * image). Tracks source-vs-eye aspect, so it follows window resizes. */
+    int pan_x, pan_y;
     /* detection state */
     int smode, scand, sagree, detframe;
     uint8_t gray[DET_W*DET_H];
@@ -185,6 +189,7 @@ void vr_present_dispatch(vr_present *p){
 void vr_present_set_stereo(vr_present *p, int mode){ p->stereo_force = mode; }
 void vr_present_set_fit(vr_present *p, int fit, double zoom){ p->fit=fit; p->zoom = zoom>0?zoom:1.0; }
 void vr_present_set_offset(vr_present *p, int xoff, int yoff){ p->xoff=xoff; p->yoff=yoff; }
+void vr_present_pan_range(const vr_present *p, int *rx, int *ry){ if(rx)*rx=p->pan_x; if(ry)*ry=p->pan_y; }
 
 /* =============================== scaling ================================ */
 static void scale_bgrx(vr_present *p, const uint8_t *src, int sw, int sh, int sstride,
@@ -193,6 +198,12 @@ static void scale_bgrx(vr_present *p, const uint8_t *src, int sw, int sh, int ss
     double sc = (p->fit==VR_FIT_COVER) ? (fx>fy?fx:fy) : (fx<fy?fx:fy);
     sc *= p->zoom;
     int ow=(int)(sw*sc), oh=(int)(sh*sc); if(ow<1)ow=1; if(oh<1)oh=1;
+    /* head-tracking reach: how far to shift so a content edge lands at the
+     * viewport centre. The image is centred at zero offset, its edges are half
+     * its size away, so that shift is exactly half the scaled image on each axis
+     * (= the aspect crop plus half the eye). Follows the window aspect + resize. */
+    p->pan_x = ow/2;
+    p->pan_y = oh/2;
     int offx=(dw-ow)/2+p->xoff, offy=(dh-oh)/2+p->yoff;
     memset(dst,0,(size_t)dstride*dh);
     for(int y=0;y<oh;y++){

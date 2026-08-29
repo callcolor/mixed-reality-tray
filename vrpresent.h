@@ -77,4 +77,10 @@ void vr_present_set_stereo(vr_present *p, int mode);      /* VR_STEREO_* */
 void vr_present_set_fit(vr_present *p, int fit, double zoom);
 void vr_present_set_offset(vr_present *p, int xoff, int yoff);  /* per-eye px shift */
 
+/* Per-axis head-tracking reach (px each way) of the last presented frame: the
+ * shift that brings a content edge to the viewport centre (= half the scaled
+ * image on that axis). Tracks the source window's aspect, so it updates as the
+ * window is resized. Head tracking uses this instead of a fixed limit. */
+void vr_present_pan_range(const vr_present *p, int *rx, int *ry);
+
 #endif /* VRMIRROR_VRPRESENT_H */

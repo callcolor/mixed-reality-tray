@@ -14,14 +14,15 @@ WL_PROTO          = /usr/share/wayland-protocols/staging/drm-lease/drm-lease-v1.
 .PHONY: all wayland-mirror clean
 all: vrmirror-x11
 
-# vrpresent.c is the shared scanout/compositor used by both frontends (needs -lm).
-vrmirror-x11: vrmirror_x11.c vrpresent.c vrpresent.h
-	$(CC) $(CFLAGS) vrmirror_x11.c vrpresent.c -o $@ \
+# vrpresent.c is the shared scanout/compositor and vrhead.c the shared gyro
+# head-tracking, used by both frontends (both need -lm).
+vrmirror-x11: vrmirror_x11.c vrpresent.c vrhead.c vrpresent.h vrhead.h
+	$(CC) $(CFLAGS) vrmirror_x11.c vrpresent.c vrhead.c -o $@ \
 		$$(pkg-config --cflags --libs $(VRMIRROR_X11_PKGS)) -lm
 
 wayland-mirror: vrmirror-wl
-vrmirror-wl: vrmirror_wl.c vrpresent.c vrpresent.h drm-lease-v1-protocol.c drm-lease-v1-client-protocol.h
-	$(CC) $(CFLAGS) vrmirror_wl.c vrpresent.c drm-lease-v1-protocol.c -o $@ \
+vrmirror-wl: vrmirror_wl.c vrpresent.c vrhead.c vrpresent.h vrhead.h drm-lease-v1-protocol.c drm-lease-v1-client-protocol.h
+	$(CC) $(CFLAGS) vrmirror_wl.c vrpresent.c vrhead.c drm-lease-v1-protocol.c -o $@ \
 		$$(pkg-config --cflags --libs $(VRMIRROR_WL_PKGS)) -lm
 
 # generated Wayland protocol bindings (not committed; regenerated here)

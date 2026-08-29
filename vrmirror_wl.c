@@ -31,6 +31,7 @@
 #include <xf86drmMode.h>          /* wl_lease_acquire validates the leased fd */
 #include "drm-lease-v1-client-protocol.h"
 #include "vrpresent.h"
+#include "vrhead.h"
 
 static GMainLoop *g_loop;
 static const char *g_output = "DP-7";
@@ -115,6 +116,8 @@ static int wl_lease_acquire(void){
 static int g_drmfd = -1;                  /* leased DRM fd; borrowed by the presenter */
 static vr_present *g_present = NULL;       /* shared scanout/compositor (vrpresent.c) */
 static int g_test = 0;                     /* draw a centered crosshair instead of capturing */
+static vr_head *g_head = NULL;             /* headset gyro -> per-eye offset (vrhead.c) */
+static int g_base_xoff = 0, g_base_yoff = 0;  /* static centring offset (head adds to it) */
 
 static gboolean frame_cb(gpointer);        /* fwd: present newest frame */
 
@@ -128,10 +131,9 @@ static gboolean drm_ev_cb(GIOChannel*ch,GIOCondition cond,gpointer u){
 /* apply the shared VRMIRROR_* presentation knobs (same env as the X11 frontend) */
 static void apply_present_env(void){
     if(!g_present) return;
-    if(getenv("VRMIRROR_XOFF")||getenv("VRMIRROR_YOFF"))
-        vr_present_set_offset(g_present,
-            getenv("VRMIRROR_XOFF")?atoi(getenv("VRMIRROR_XOFF")):0,
-            getenv("VRMIRROR_YOFF")?atoi(getenv("VRMIRROR_YOFF")):0);
+    g_base_xoff = getenv("VRMIRROR_XOFF")?atoi(getenv("VRMIRROR_XOFF")):0;
+    g_base_yoff = getenv("VRMIRROR_YOFF")?atoi(getenv("VRMIRROR_YOFF")):0;
+    vr_present_set_offset(g_present, g_base_xoff, g_base_yoff);
     vr_present_set_fit(g_present,
         getenv("VRMIRROR_FIT")?VR_FIT_LETTERBOX:VR_FIT_COVER,
         getenv("VRMIRROR_ZOOM")?atof(getenv("VRMIRROR_ZOOM")):1.0);
@@ -141,6 +143,12 @@ static void apply_present_env(void){
         else if(!strcmp(sm,"mono")||!strcmp(sm,"2d"))m=VR_STEREO_MONO;
         vr_present_set_stereo(g_present,m); }
 }
+/* drain IMU packets whenever the hidraw fd is readable (advances head angle) */
+static gboolean head_cb(GIOChannel*ch,GIOCondition cond,gpointer u){
+    (void)ch;(void)cond;(void)u;
+    if(g_head) vr_head_poll(g_head);
+    return G_SOURCE_CONTINUE;
+}
 /* create the presenter on the leased fd and wire flip-event delivery */
 static int present_up(void){
     g_present = vr_present_create(g_drmfd);
@@ -149,6 +157,9 @@ static int present_up(void){
     GIOChannel *drmch = g_io_channel_unix_new(vr_present_fd(g_present));
     g_io_add_watch(drmch,G_IO_IN,drm_ev_cb,NULL);
     g_io_channel_unref(drmch);
+    g_head = vr_head_open(NULL);                     /* headset gyro (optional) */
+    if(g_head){ GIOChannel *hc = g_io_channel_unix_new(vr_head_fd(g_head));
+        g_io_add_watch(hc,G_IO_IN,head_cb,NULL); g_io_channel_unref(hc); }
     return 0;
 }
 
@@ -241,6 +252,9 @@ static void start_pipewire(int fd,uint32_t node){
 static gboolean frame_cb(gpointer u){
     (void)u;
     if(!g_present || vr_present_flip_pending(g_present)) return G_SOURCE_CONTINUE;
+    if(g_head){ int rx,ry; vr_present_pan_range(g_present,&rx,&ry); vr_head_set_range(g_head,rx,ry);
+        int hx,hy; vr_head_offset(g_head,&hx,&hy);
+        vr_present_set_offset(g_present, g_base_xoff+hx, g_base_yoff+hy); }
     if(g_test){ vr_present_test_pattern(g_present); return G_SOURCE_CONTINUE; }
     g_mutex_lock(&g_lock);
     if(g_have) vr_present_frame(g_present, g_latest, g_lw, g_lh, (size_t)g_lw*4);
@@ -299,6 +313,7 @@ int main(int argc,char**argv){
 
     /* teardown: always release the lease */
     if(g_pw){ pw_thread_loop_stop(g_pw); }
+    if(g_head){ vr_head_close(g_head); g_head=NULL; }
     if(g_present){ vr_present_destroy(g_present); g_present=NULL; }
     if(g_drmfd>=0){ close(g_drmfd); g_drmfd=-1; }
     if(g_lease_obj) wp_drm_lease_v1_destroy(g_lease_obj);
