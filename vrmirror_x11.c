@@ -1,5 +1,7 @@
-/* vrtray.c -- single-binary system-tray app that mirrors a desktop window to
- * the WMR headset. XApp status icon (Cinnamon-native) + GTK3 menu, with the
+/* vrmirror_x11.c -- the X11 frontend of vrmirror: a single-binary system-tray
+ * app that mirrors a desktop window to the WMR headset. Same app as vrmirror_wl,
+ * adapted to the X11 desktop (RandR lease + XComposite capture) instead of
+ * Wayland. XApp status icon (Cinnamon-native) + GTK3 menu, with the
  * DRM-lease / XComposite-capture / KMS-scanout engine folded into one process.
  *
  * Menu:
@@ -12,7 +14,7 @@
  * Launching the app does nothing to the display until you Enable; quitting
  * (Exit, window-manager kill, or SIGTERM) always releases the lease.
  *
- * build: gcc vrtray.c -o vrtray \
+ * build: gcc vrmirror_x11.c -o vrmirror-x11 \
  *   $(pkg-config --cflags --libs gtk+-3.0 xapp xcb xcb-randr libdrm x11 xcomposite)
  */
 #include <stdio.h>
@@ -20,13 +22,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
-#include <errno.h>
-#include <poll.h>
-#include <sys/mman.h>
 #include <xcb/xcb.h>
 #include <xcb/randr.h>
-#include <xf86drm.h>
-#include <xf86drmMode.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
@@ -34,14 +31,12 @@
 #include <gtk/gtk.h>
 #include <glib-unix.h>
 #include <libxapp/xapp-status-icon.h>
+#include "vrpresent.h"
 
 /* -------------------------- engine state (single process) --------------- */
-struct fbuf { uint32_t handle, pitch, fb_id; uint64_t size; uint8_t *map; };
-static int      g_drmfd = -1;
-static uint32_t g_conn_id, g_crtc_id;
-static drmModeModeInfo g_mode;
-static struct fbuf g_fb[2];
-static int      g_front = 0, g_flip_pending = 0;
+static int         g_drmfd  = -1;      /* leased DRM fd; owned here, borrowed by presenter */
+static vr_present *g_present = NULL;    /* shared scanout/compositor (vrpresent.c) */
+static guint       g_drm_src = 0;       /* GLib watch that reaps flip-complete events */
 
 static xcb_connection_t *g_xcb = NULL;
 static xcb_randr_lease_t g_lease = 0;
@@ -51,10 +46,12 @@ static Window   g_root, g_target = 0;
 static Pixmap   g_pix = 0;
 static int      g_pw = 0, g_ph = 0;
 
+static uint8_t *g_frame = NULL;         /* packed BGRX capture, handed to the presenter */
+static size_t   g_framesz = 0;
+
 static const char *g_output = "DP-3-2";
 static XAppStatusIcon *g_icon = NULL;
 
-static void on_flip(int f,unsigned a,unsigned b,unsigned c,void*u){(void)f;(void)a;(void)b;(void)c;(void)u; g_flip_pending=0;}
 /* ignore X errors from capturing windows that vanish/resize under us */
 static int xerr(Display *d, XErrorEvent *e){ (void)d;(void)e; return 0; }
 
@@ -104,44 +101,29 @@ static int lease_acquire(void){
     g_drmfd=fds[0];
     return 0;
 }
-static int lease_on(void){ return g_drmfd>=0; }
+static int lease_on(void){ return g_present!=NULL; }   /* headset lit */
 
-static int mk_fb(int W,int H,struct fbuf*b){
-    uint64_t off=0; memset(b,0,sizeof*b);
-    if(drmModeCreateDumbBuffer(g_drmfd,W,H,32,0,&b->handle,&b->pitch,&b->size))return -1;
-    if(drmModeAddFB(g_drmfd,W,H,24,32,b->pitch,b->handle,&b->fb_id))return -1;
-    if(drmModeMapDumbBuffer(g_drmfd,b->handle,&off))return -1;
-    b->map=mmap(0,b->size,PROT_READ|PROT_WRITE,MAP_SHARED,g_drmfd,off);
-    if(b->map==MAP_FAILED)return -1;
-    memset(b->map,0,b->size); return 0;
+/* reap flip-completion events from the presenter's DRM fd (clears flip-pending) */
+static gboolean drm_cb(GIOChannel *ch, GIOCondition c, gpointer u){
+    (void)ch;(void)c;(void)u;
+    if(g_present) vr_present_dispatch(g_present);
+    return G_SOURCE_CONTINUE;
 }
-static int kms_up(void){
-    drmModeRes *dr=drmModeGetResources(g_drmfd);
-    if(!dr||dr->count_connectors<1||dr->count_crtcs<1) return -1;
-    g_conn_id=dr->connectors[0]; g_crtc_id=dr->crtcs[0];
-    drmModeConnector *c=drmModeGetConnector(g_drmfd,g_conn_id);
-    if(!c||c->count_modes<1){ drmModeFreeResources(dr); return -1; }
-    int best=0;
-    for(int m=1;m<c->count_modes;m++){
-        long a=(long)c->modes[m].hdisplay*c->modes[m].vdisplay;
-        long ab=(long)c->modes[best].hdisplay*c->modes[best].vdisplay;
-        if(a>ab||(a==ab&&c->modes[m].vrefresh>c->modes[best].vrefresh)) best=m;
-    }
-    g_mode=c->modes[best]; drmModeFreeConnector(c); drmModeFreeResources(dr);
-    int W=g_mode.hdisplay,H=g_mode.vdisplay;
-    if(mk_fb(W,H,&g_fb[0])||mk_fb(W,H,&g_fb[1])) return -1;
-    g_front=0; g_flip_pending=0;
-    if(drmModeSetCrtc(g_drmfd,g_crtc_id,g_fb[0].fb_id,0,0,&g_conn_id,1,&g_mode)) return -1;
-    printf("[vrtray] panel %dx%d@%dHz lit\n",W,H,g_mode.vrefresh); fflush(stdout);
-    return 0;
-}
-static void kms_down(void){
-    for(int i=0;i<2;i++){
-        if(g_fb[i].map&&g_fb[i].map!=MAP_FAILED) munmap(g_fb[i].map,g_fb[i].size);
-        if(g_fb[i].fb_id) drmModeRmFB(g_drmfd,g_fb[i].fb_id);
-        if(g_fb[i].handle) drmModeDestroyDumbBuffer(g_drmfd,g_fb[i].handle);
-        memset(&g_fb[i],0,sizeof g_fb[i]);
-    }
+/* apply the shared VRMIRROR_* presentation knobs (same env as the Wayland frontend) */
+static void apply_present_env(void){
+    if(!g_present) return;
+    if(getenv("VRMIRROR_XOFF")||getenv("VRMIRROR_YOFF"))
+        vr_present_set_offset(g_present,
+            getenv("VRMIRROR_XOFF")?atoi(getenv("VRMIRROR_XOFF")):0,
+            getenv("VRMIRROR_YOFF")?atoi(getenv("VRMIRROR_YOFF")):0);
+    vr_present_set_fit(g_present,
+        getenv("VRMIRROR_FIT")?VR_FIT_LETTERBOX:VR_FIT_COVER,
+        getenv("VRMIRROR_ZOOM")?atof(getenv("VRMIRROR_ZOOM")):1.0);
+    const char *sm=getenv("VRMIRROR_STEREO");
+    if(sm){ int m=VR_STEREO_AUTO;
+        if(!strcmp(sm,"sbs"))m=VR_STEREO_SBS; else if(!strcmp(sm,"ou"))m=VR_STEREO_OU;
+        else if(!strcmp(sm,"mono")||!strcmp(sm,"2d"))m=VR_STEREO_MONO;
+        vr_present_set_stereo(g_present,m); }
 }
 static void lease_release(void){
     if(g_drmfd>=0){
@@ -152,25 +134,11 @@ static void lease_release(void){
     if(g_xcb){ xcb_disconnect(g_xcb); g_xcb=NULL; }
     g_lease=0;
 }
-static void flip_back(void){
-    int back=g_front^1;
-    struct pollfd pfd={.fd=g_drmfd,.events=POLLIN};
-    drmEventContext ev={.version=2,.page_flip_handler=on_flip};
-    if(drmModePageFlip(g_drmfd,g_crtc_id,g_fb[back].fb_id,DRM_MODE_PAGE_FLIP_EVENT,NULL)==0){
-        g_flip_pending=1; int guard=0;
-        while(g_flip_pending && guard++<10){ if(poll(&pfd,1,50)>0) drmHandleEvent(g_drmfd,&ev); else break; }
-    } else {
-        drmModeSetCrtc(g_drmfd,g_crtc_id,g_fb[back].fb_id,0,0,&g_conn_id,1,&g_mode);
-    }
-    g_front=back;
-}
-static void blank_panel(void){
-    if(!lease_on()) return;
-    int back=g_front^1; memset(g_fb[back].map,0,g_fb[back].size); flip_back();
-}
-
 /* ---------------------------- window capture ---------------------------- */
-static int capture_into_eye(uint8_t *eye,int dw,int dh,size_t estride){
+/* Capture the target window into a packed BGRX frame (g_frame); the presenter
+ * does the scaling, stereo split, and flip. XImage may be 24- or 32-bpp, so we
+ * repack to a tight 4-byte-per-pixel buffer here. */
+static int capture_frame(int *ow, int *oh){
     if(!g_target) return -1;
     XWindowAttributes wa;
     if(!XGetWindowAttributes(g_dpy,g_target,&wa)||wa.map_state!=IsViewable) return -1;
@@ -184,40 +152,27 @@ static int capture_into_eye(uint8_t *eye,int dw,int dh,size_t estride){
     if(!img&&g_pix){ XFreePixmap(g_dpy,g_pix); g_pix=0; img=XGetImage(g_dpy,g_target,0,0,sw,sh,AllPlanes,ZPixmap); }
     if(!img) return -1;
     int Bpp=img->bits_per_pixel/8;
-    double scale=(double)dw/sw; if((double)dh/sh<scale) scale=(double)dh/sh;
-    int ow=(int)(sw*scale), oh=(int)(sh*scale);
-    if(ow<1) ow=1;
-    if(oh<1) oh=1;
-    int offx=(dw-ow)/2, offy=(dh-oh)/2;
-    memset(eye,0,estride*dh);
-    for(int y=0;y<oh;y++){
-        int sy=(int)(y/scale); if(sy>=sh) sy=sh-1;
-        uint8_t *drow=eye+(size_t)(offy+y)*estride+(size_t)offx*4;
-        uint8_t *srow=(uint8_t*)img->data+(size_t)sy*img->bytes_per_line;
-        for(int x=0;x<ow;x++){
-            int sx=(int)(x/scale); if(sx>=sw) sx=sw-1;
-            uint8_t *sp=srow+(size_t)sx*Bpp;
+    size_t need=(size_t)sw*sh*4;
+    if(g_framesz<need){ free(g_frame); g_frame=malloc(need); g_framesz=g_frame?need:0; }
+    if(!g_frame){ XDestroyImage(img); return -1; }
+    for(int y=0;y<sh;y++){
+        uint8_t *drow=g_frame+(size_t)y*sw*4;
+        uint8_t *srow=(uint8_t*)img->data+(size_t)y*img->bytes_per_line;
+        for(int x=0;x<sw;x++){
+            uint8_t *sp=srow+(size_t)x*Bpp;
             drow[0]=sp[0]; drow[1]=sp[1]; drow[2]=sp[2]; drow[3]=0;  /* BGRX */
             drow+=4;
         }
     }
     XDestroyImage(img);
+    *ow=sw; *oh=sh;
     return 0;
 }
 static void present_target(void){
-    if(!lease_on()||!g_target) return;
-    int W=g_mode.hdisplay,H=g_mode.vdisplay,half=W/2;
-    size_t estride=(size_t)half*4;
-    static uint8_t *eye=NULL; static size_t eyesz=0;
-    if(eyesz<estride*H){ free(eye); eye=malloc(estride*H); eyesz=estride*H; }
-    if(capture_into_eye(eye,half,H,estride)!=0) return;
-    int back=g_front^1;
-    for(int y=0;y<H;y++){
-        uint8_t *d=g_fb[back].map+(size_t)y*g_fb[back].pitch;
-        memcpy(d,eye+(size_t)y*estride,estride);
-        memcpy(d+estride,eye+(size_t)y*estride,estride);
-    }
-    flip_back();
+    if(!g_present||!g_target) return;
+    int w,h;
+    if(capture_frame(&w,&h)!=0) return;
+    vr_present_frame(g_present, g_frame, w, h, (size_t)w*4);
 }
 
 /* ----------------------- click-to-pick a window ------------------------- */
@@ -258,7 +213,9 @@ static void set_target(Window w){
 
 /* ------------------------------- UI glue -------------------------------- */
 static guint g_frame_src = 0;
-static gboolean frame_cb(gpointer u){ (void)u; if(lease_on()&&g_target) present_target(); return G_SOURCE_CONTINUE; }
+static gboolean frame_cb(gpointer u){ (void)u;
+    if(g_present&&g_target&&!vr_present_flip_pending(g_present)) present_target();
+    return G_SOURCE_CONTINUE; }
 static void icon_state(void){
     const char *ic = !lease_on() ? "video-display-symbolic"
                     : (g_target ? "media-playback-start-symbolic" : "video-display-symbolic");
@@ -267,8 +224,14 @@ static void icon_state(void){
     if(g_icon){ xapp_status_icon_set_icon_name(g_icon,ic); xapp_status_icon_set_tooltip_text(g_icon,tt); }
 }
 static int ensure_enabled(void){
-    if(lease_on()) return 0;
-    if(lease_acquire()!=0||kms_up()!=0){ lease_release(); return -1; }
+    if(g_present) return 0;
+    if(lease_acquire()!=0){ lease_release(); return -1; }
+    g_present=vr_present_create(g_drmfd);
+    if(!g_present){ lease_release(); return -1; }
+    apply_present_env();
+    GIOChannel *ch=g_io_channel_unix_new(vr_present_fd(g_present));   /* reap flip events */
+    g_drm_src=g_io_add_watch(ch,G_IO_IN,drm_cb,NULL);
+    g_io_channel_unref(ch);
     if(!g_frame_src) g_frame_src=g_timeout_add(16,frame_cb,NULL);   /* ~60fps */
     icon_state(); return 0;
 }
@@ -276,16 +239,20 @@ static void do_enable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     if(ensure_enabled()!=0) g_warning("enable failed (panel asleep? wear the headset)"); }
 static void do_disable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     g_target=0; if(g_pix){XFreePixmap(g_dpy,g_pix);g_pix=0;}
-    if(lease_on()){ kms_down(); lease_release(); }
+    if(g_drm_src){ g_source_remove(g_drm_src); g_drm_src=0; }
+    if(g_present){ vr_present_destroy(g_present); g_present=NULL; }
+    if(g_drmfd>=0) lease_release();
     if(g_frame_src){ g_source_remove(g_frame_src); g_frame_src=0; }
     icon_state(); }
 static void do_pick(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     if(ensure_enabled()!=0){ g_warning("cannot enable headset"); return; }
     Window w=pick_window();
-    if(w){ set_target(w); printf("[vrtray] mirroring 0x%lx\n",w); }
+    if(w){ set_target(w); printf("[x11] mirroring 0x%lx\n",w); }
     icon_state(); }
 static void do_stop(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
-    g_target=0; if(g_pix){XFreePixmap(g_dpy,g_pix);g_pix=0;} blank_panel(); icon_state(); }
+    g_target=0; if(g_pix){XFreePixmap(g_dpy,g_pix);g_pix=0;}
+    if(g_present) vr_present_blank(g_present);
+    icon_state(); }
 static void do_quit(GtkMenuItem*m,gpointer u){ (void)m;(void)u; gtk_main_quit(); }
 
 static GtkWidget* build_menu(void){
@@ -320,7 +287,7 @@ int main(int argc,char**argv){
     int evb,erb; if(!XCompositeQueryExtension(g_dpy,&evb,&erb)){ fprintf(stderr,"no XComposite\n"); return 1; }
 
     g_icon=xapp_status_icon_new();
-    xapp_status_icon_set_name(g_icon,"vrtray");
+    xapp_status_icon_set_name(g_icon,"vrmirror-x11");
     GtkWidget *menu=build_menu();
     xapp_status_icon_set_primary_menu(g_icon,GTK_MENU(menu));
     xapp_status_icon_set_secondary_menu(g_icon,GTK_MENU(menu));
@@ -329,14 +296,16 @@ int main(int argc,char**argv){
     g_unix_signal_add(SIGINT,on_signal,NULL);
     g_unix_signal_add(SIGTERM,on_signal,NULL);
 
-    printf("[vrtray] running (output %s). Use the tray menu.\n",g_output); fflush(stdout);
+    printf("[x11] running (output %s). Use the tray menu.\n",g_output); fflush(stdout);
     gtk_main();
 
     /* teardown: always release the lease */
     g_target=0; if(g_pix) XFreePixmap(g_dpy,g_pix);
     if(g_frame_src) g_source_remove(g_frame_src);
-    if(lease_on()){ kms_down(); lease_release(); }
+    if(g_drm_src) g_source_remove(g_drm_src);
+    if(g_present){ vr_present_destroy(g_present); g_present=NULL; }
+    if(g_drmfd>=0) lease_release();
     XCloseDisplay(g_dpy);
-    printf("[vrtray] exit (lease released)\n");
+    printf("[x11] exit (lease released)\n");
     return 0;
 }

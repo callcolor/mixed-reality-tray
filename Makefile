@@ -1,28 +1,28 @@
 CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -O2
 
-# --- vrtray: the product (X11 tray app that mirrors a window to the headset) ---
-VRTRAY_PKGS = gtk+-3.0 xapp xcb xcb-randr libdrm x11 xcomposite
+# vrmirror -- one app (mirror a desktop window to the WMR headset), two desktop
+# frontends. The X11 frontend is built by default; the Wayland one on request.
 
-# --- vrmirror-wl: the Wayland/GNOME counterpart (portal + PipeWire capture) ---
-VRMIRROR_PKGS = libportal libpipewire-0.3 gio-2.0 wayland-client libdrm
+# --- vrmirror-x11: X11 frontend (RandR lease + XComposite capture) ---
+VRMIRROR_X11_PKGS = gtk+-3.0 xapp xcb xcb-randr libdrm x11 xcomposite
 
-# --- vrplayer: optional Wayland file-player (kept for Wayland lease/scanout) ---
-VRPLAYER_PKGS = mpv wayland-client libdrm
-WL_PROTO      = /usr/share/wayland-protocols/staging/drm-lease/drm-lease-v1.xml
+# --- vrmirror-wl: Wayland/GNOME frontend (wp_drm_lease + portal/PipeWire) ---
+VRMIRROR_WL_PKGS  = libportal libpipewire-0.3 gio-2.0 wayland-client libdrm
+WL_PROTO          = /usr/share/wayland-protocols/staging/drm-lease/drm-lease-v1.xml
 
-.PHONY: all wayland wayland-mirror clean
-all: vrtray
+.PHONY: all wayland-mirror clean
+all: vrmirror-x11
 
-vrtray: vrtray.c
-	$(CC) $(CFLAGS) $< -o $@ $$(pkg-config --cflags --libs $(VRTRAY_PKGS))
+# vrpresent.c is the shared scanout/compositor used by both frontends (needs -lm).
+vrmirror-x11: vrmirror_x11.c vrpresent.c vrpresent.h
+	$(CC) $(CFLAGS) vrmirror_x11.c vrpresent.c -o $@ \
+		$$(pkg-config --cflags --libs $(VRMIRROR_X11_PKGS)) -lm
 
 wayland-mirror: vrmirror-wl
-vrmirror-wl: vrmirror_wl.c drm-lease-v1-protocol.c drm-lease-v1-client-protocol.h
-	$(CC) $(CFLAGS) vrmirror_wl.c drm-lease-v1-protocol.c -o $@ \
-		$$(pkg-config --cflags --libs $(VRMIRROR_PKGS)) -lm
-
-wayland: vrplayer
+vrmirror-wl: vrmirror_wl.c vrpresent.c vrpresent.h drm-lease-v1-protocol.c drm-lease-v1-client-protocol.h
+	$(CC) $(CFLAGS) vrmirror_wl.c vrpresent.c drm-lease-v1-protocol.c -o $@ \
+		$$(pkg-config --cflags --libs $(VRMIRROR_WL_PKGS)) -lm
 
 # generated Wayland protocol bindings (not committed; regenerated here)
 drm-lease-v1-client-protocol.h:
@@ -30,9 +30,5 @@ drm-lease-v1-client-protocol.h:
 drm-lease-v1-protocol.c:
 	wayland-scanner private-code $(WL_PROTO) $@
 
-vrplayer: vrplayer.c present.c present.h drm-lease-v1-protocol.c drm-lease-v1-client-protocol.h
-	$(CC) $(CFLAGS) vrplayer.c present.c drm-lease-v1-protocol.c -o $@ \
-		$$(pkg-config --cflags --libs $(VRPLAYER_PKGS))
-
 clean:
-	rm -f vrtray vrplayer vrmirror-wl drm-lease-v1-client-protocol.h drm-lease-v1-protocol.c
+	rm -f vrmirror-x11 vrmirror-wl drm-lease-v1-client-protocol.h drm-lease-v1-protocol.c

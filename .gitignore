@@ -1,6 +1,5 @@
 # build artifacts
-/vrtray
-/vrplayer
+/vrmirror-x11
 /vrmirror-wl
 *.o
 
@@ -15,3 +14,4 @@ testclip.mp4
 
 .claude
 *.log
+CLAUDE.md
