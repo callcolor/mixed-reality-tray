@@ -1,4 +1,4 @@
-# mixed-reality-sucks
+# mixed-reality-tray
 
 Drive an old Windows Mixed Reality headset (Acer AH101) as a plain content-viewing
 display on Linux — no Monado, no SteamVR. The headset panel is leased directly from
