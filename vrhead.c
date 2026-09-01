@@ -29,6 +29,7 @@
 #include <dirent.h>
 
 #include "vrhead.h"
+#include "vrlog.h"
 
 #define GYRO_OFF   41            /* byte offset of gyro[3][32] in the 0x01 packet */
 #define GYRO_N     32            /* samples per axis */
@@ -92,18 +93,18 @@ vr_head *vr_head_open(const char *path){
     char autopath[sizeof "/dev/" + 256];
     if(!path){
         if(!autodetect(autopath, sizeof autopath)){
-            fprintf(stderr, "[head] no HoloLens Sensors hidraw found; head tracking off\n");
+            vrlog("[head] no HoloLens Sensors hidraw found; head tracking off\n");
             return NULL;
         }
         path = autopath;
     }
     int fd = open(path, O_RDWR | O_NONBLOCK);
-    if(fd < 0){ fprintf(stderr, "[head] open %s: %s\n", path, strerror(errno)); return NULL; }
+    if(fd < 0){ vrlog("[head] open %s: %s\n", path, strerror(errno)); return NULL; }
 
     /* start the sensor stream (0x02 control msg, 0x07 = IMU on) */
     unsigned char cmd[64] = {0}; cmd[0] = 0x02; cmd[1] = 0x07;
     if(write(fd, cmd, sizeof cmd) < 0){
-        fprintf(stderr, "[head] enable write failed: %s\n", strerror(errno));
+        vrlog("[head] enable write failed: %s\n", strerror(errno));
         close(fd); return NULL;
     }
 
@@ -130,7 +131,7 @@ vr_head *vr_head_open(const char *path){
     if(h->cpd < 1e-3) h->cpd = 16.4;
     if(h->tau < 0) h->tau = 0;
 
-    fprintf(stderr, "[head] tracking on (%s): yaw=axis%d*%+g pitch=axis%d*%+g "
+    vrlog("[head] tracking on (%s): yaw=axis%d*%+g pitch=axis%d*%+g "
                     "gain=%gpx/deg reach=edge→centre%+dpx%s recentre=%s\n",
             path, h->yaw_axis, h->yaw_sign, h->pitch_axis, h->pitch_sign,
             h->gain, h->margin, h->cappx>0 ? " (capped)" : "",
@@ -195,7 +196,7 @@ void vr_head_poll(vr_head *h){
         if(t - h->t_open >= BIAS_SECS && h->bcount >= BIAS_MINPK){
             for(int a = 0; a < 3; a++) h->bias[a] = h->bsum[a] / h->bcount;
             h->biased = 1;
-            fprintf(stderr, "[head] bias zeroed: %.1f %.1f %.1f\n",
+            vrlog("[head] bias zeroed: %.1f %.1f %.1f\n",
                     h->bias[0], h->bias[1], h->bias[2]);
         }
         h->t_last = t;
@@ -228,7 +229,7 @@ void vr_head_poll(vr_head *h){
 
     if(h->debug && (++h->dbg % 30) == 0){
         int xo, yo; vr_head_offset(h, &xo, &yo);
-        fprintf(stderr, "[head] rate x=%.1f y=%.1f z=%.1f  yaw=%.1fdeg pitch=%.1fdeg  off=(%d,%d)\n",
+        vrlog("[head] rate x=%.1f y=%.1f z=%.1f  yaw=%.1fdeg pitch=%.1fdeg  off=(%d,%d)\n",
                 avg[0]-h->bias[0], avg[1]-h->bias[1], avg[2]-h->bias[2],
                 h->yaw_deg, h->pitch_deg, xo, yo);
     }

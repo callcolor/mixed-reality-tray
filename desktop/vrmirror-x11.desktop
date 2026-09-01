@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=vrmirror (X11)
+GenericName=Headset window mirror
+Comment=Mirror a desktop window onto a Windows Mixed Reality headset
+Exec=vrmirror-x11
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=VR;headset;mirror;WMR;
+StartupNotify=false

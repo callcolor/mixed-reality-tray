@@ -1,0 +1,128 @@
+name: build & release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One release at a time; a newer push supersedes an in-flight one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VERSION: v0.1.${{ github.run_number }}
+
+jobs:
+  # --- Fedora build (the project's home distro) ------------------------------
+  # Built in a fedora:42 container rather than on the newest release: glibc is
+  # forward-compatible, so a 42 build runs on 43/44 but not the other way round.
+  # Add another `build-fedora`-shaped job (or bump the image) for more targets.
+  build-fedora:
+    runs-on: ubuntu-24.04
+    container: fedora:42
+
+    steps:
+      # Before checkout so actions/checkout gets a real git clone.
+      - name: Install build dependencies
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            git tar gzip make gcc pkgconf-pkg-config \
+            gtk3-devel xapps-devel libayatana-appindicator-gtk3-devel \
+            libX11-devel libxcb-devel libXcomposite-devel libdrm-devel \
+            libportal-devel pipewire-devel glib2-devel \
+            wayland-devel wayland-protocols-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Build vrmirror-x11
+        run: make VERSION="$VERSION"
+
+      - name: Build vrmirror-wl
+        run: make wayland-mirror VERSION="$VERSION"
+
+      - name: Package
+        run: |
+          dist="mixed-reality-tray-${VERSION}-fedora42-x86_64"
+          mkdir -p "dist/${dist}"
+          cp vrmirror-x11 vrmirror-wl README.md LICENSE "dist/${dist}/"
+          cp -r desktop "dist/${dist}/"
+          tar -czf "dist/${dist}.tar.gz" -C dist "${dist}"
+          rm -rf "dist/${dist}"
+          (cd dist && sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-fedora42
+          path: dist/*
+
+  # --- Ubuntu build ---------------------------------------------------------
+  build-ubuntu:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu equivalents of the Fedora devel packages, plus wayland-scanner
+      # (libwayland-bin) and the staging drm-lease XML (wayland-protocols) that
+      # `make wayland-mirror` generates its bindings from.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libxapp-dev libayatana-appindicator3-dev \
+            libx11-dev libxcb1-dev libxcb-randr0-dev libxcomposite-dev \
+            libdrm-dev \
+            libportal-dev libpipewire-0.3-dev libglib2.0-dev \
+            libwayland-dev libwayland-bin wayland-protocols
+
+      - name: Build vrmirror-x11
+        run: make VERSION="$VERSION"
+
+      - name: Build vrmirror-wl
+        run: make wayland-mirror VERSION="$VERSION"
+
+      - name: Package
+        run: |
+          dist="mixed-reality-tray-${VERSION}-ubuntu24.04-x86_64"
+          mkdir -p "dist/${dist}"
+          cp vrmirror-x11 vrmirror-wl README.md LICENSE "dist/${dist}/"
+          cp -r desktop "dist/${dist}/"
+          tar -czf "dist/${dist}.tar.gz" -C dist "${dist}"
+          rm -rf "dist/${dist}"
+          (cd dist && sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-ubuntu24.04
+          path: dist/*
+
+  # --- One release carrying both builds -------------------------------------
+  release:
+    needs: [build-fedora, build-ubuntu]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$VERSION" \
+            --target "${{ github.sha }}" \
+            --title "$VERSION" \
+            --generate-notes \
+            --latest \
+            dist/*

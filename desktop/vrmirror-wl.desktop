@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=vrmirror (Wayland)
+GenericName=Headset window mirror
+Comment=Mirror a desktop window onto a Windows Mixed Reality headset
+Exec=vrmirror-wl
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=VR;headset;mirror;WMR;
+StartupNotify=false

@@ -31,10 +31,14 @@
 #include <xf86drmMode.h>          /* wl_lease_acquire validates the leased fd */
 #include "drm-lease-v1-client-protocol.h"
 #include "vrpresent.h"
+#include "vrlog.h"
 #include "vrhead.h"
 
 static GMainLoop *g_loop;
-static const char *g_output = "DP-7";
+/* Connector to lease. NULL = auto: wp_drm_lease only ever advertises connectors
+ * the compositor has flagged non-desktop (i.e. headsets), so trying each one in
+ * turn finds the panel without a hardcoded name. argv[1] forces a specific one. */
+static const char *g_output = NULL;
 
 /* =============================== Wayland lease ========================== */
 struct conn_info {
@@ -80,32 +84,42 @@ static const struct wp_drm_lease_v1_listener lease_listener={.lease_fd=l_lease_f
 /* returns leased master-capable DRM fd, or -1 */
 static int wl_lease_acquire(void){
     g_wl=wl_display_connect(NULL);
-    if(!g_wl){ fprintf(stderr,"[wl] cannot connect\n"); return -1; }
+    if(!g_wl){ vrlog("[wl] cannot connect\n"); return -1; }
     struct wl_registry*reg=wl_display_get_registry(g_wl);
     wl_registry_add_listener(reg,&reg_listener,NULL);
     wl_display_roundtrip(g_wl); wl_display_roundtrip(g_wl); wl_display_roundtrip(g_wl);
+    int ncand=0;
     for(struct conn_info*c=g_conns;c;c=c->next){
-        if(strcmp(c->name,g_output)!=0) continue;
-        fprintf(stderr,"[wl] trying '%s' on lease-device %p\n",c->name,(void*)c->dev);
+        if(!c->name[0]) continue;                            /* withdrawn connector */
+        if(g_output && strcmp(c->name,g_output)!=0) continue;
+        ncand++;
+        vrlog("[wl] trying '%s' on lease-device %p\n",c->name,(void*)c->dev);
         struct wp_drm_lease_request_v1*req=wp_drm_lease_device_v1_create_lease_request(c->dev);
         wp_drm_lease_request_v1_request_connector(req,c->proxy);
         struct wp_drm_lease_v1*lease=wp_drm_lease_request_v1_submit(req);
         wp_drm_lease_v1_add_listener(lease,&lease_listener,NULL);
         g_lease_fd=-1; g_lease_finished=0;
         while(g_lease_fd<0 && !g_lease_finished) if(wl_display_roundtrip(g_wl)<0) break;
-        if(g_lease_fd<0){ fprintf(stderr,"[wl] denied on this device\n"); wp_drm_lease_v1_destroy(lease); continue; }
+        if(g_lease_fd<0){ vrlog("[wl] denied on this device\n"); wp_drm_lease_v1_destroy(lease); continue; }
         /* validate: a grant from the wrong GPU enumerates no KMS resources */
         drmModeRes*r=drmModeGetResources(g_lease_fd);
         if(r&&r->count_connectors>=1&&r->count_crtcs>=1){
-            fprintf(stderr,"[wl] leased %s (usable: %d conn / %d crtc)\n",g_output,r->count_connectors,r->count_crtcs);
+            vrlog("[wl] leased %s (usable: %d conn / %d crtc)\n",c->name,r->count_connectors,r->count_crtcs);
             drmModeFreeResources(r); g_lease_obj=lease; return g_lease_fd;
         }
-        fprintf(stderr,"[wl] grant unusable (%s); trying next device\n", r?"no conn/crtc":strerror(errno));
+        vrlog("[wl] grant unusable (%s); trying next device\n", r?"no conn/crtc":strerror(errno));
         if(r) drmModeFreeResources(r);
         close(g_lease_fd); g_lease_fd=-1;
         wp_drm_lease_v1_destroy(lease);
     }
-    fprintf(stderr,"[wl] no usable leasable connector '%s'\n",g_output);
+    if(g_output)
+        vrlog("[wl] no usable leasable connector named '%s'\n",g_output);
+    else if(ncand)
+        vrlog("[wl] %d leasable connector(s) offered, none usable "
+                       "(headset asleep, or granted on the wrong GPU)\n",ncand);
+    else
+        vrlog("[wl] compositor offered no leasable connectors -- "
+                       "headset plugged in and awake?\n");
     return -1;
 }
 
@@ -173,7 +187,7 @@ static void on_param_changed(void*u,uint32_t id,const struct spa_pod*param){
     uint32_t mt,mst; if(spa_format_parse(param,&mt,&mst)<0)return;
     if(mt!=SPA_MEDIA_TYPE_video||mst!=SPA_MEDIA_SUBTYPE_raw)return;
     spa_format_video_raw_parse(param,&g_vinfo);
-    printf("[cap] %ux%u\n",g_vinfo.size.width,g_vinfo.size.height); fflush(stdout);
+    vrlog("[cap] %ux%u\n",g_vinfo.size.width,g_vinfo.size.height);
     uint8_t b[1024]; struct spa_pod_builder pb=SPA_POD_BUILDER_INIT(b,sizeof b);
     const struct spa_pod*ps[2];
     ps[0]=spa_pod_builder_add_object(&pb,
@@ -264,34 +278,35 @@ static gboolean frame_cb(gpointer u){
 
 /* =============================== portal ================================ */
 static void cleanup_and_quit(void){ g_main_loop_quit(g_loop); }
-static void on_closed(XdpSession*s,gpointer u){ (void)s;(void)u; printf("[portal] session closed (stopped from top bar)\n"); cleanup_and_quit(); }
+static void on_closed(XdpSession*s,gpointer u){ (void)s;(void)u; vrlog("[portal] session closed (stopped from top bar)\n"); cleanup_and_quit(); }
 
 static void on_started(GObject*src,GAsyncResult*res,gpointer u){
     (void)u; XdpSession*session=XDP_SESSION(src); GError*err=NULL;
-    if(!xdp_session_start_finish(session,res,&err)){ fprintf(stderr,"[portal] start failed/cancelled: %s\n",err?err->message:"?"); cleanup_and_quit(); return; }
+    if(!xdp_session_start_finish(session,res,&err)){ vrlog("[portal] start failed/cancelled: %s\n",err?err->message:"?"); cleanup_and_quit(); return; }
     GVariant*streams=xdp_session_get_streams(session);
     GVariantIter it; guint32 node=0; GVariant*props=NULL; g_variant_iter_init(&it,streams);
-    if(!g_variant_iter_next(&it,"(u@a{sv})",&node,&props)){ fprintf(stderr,"[portal] no stream\n"); cleanup_and_quit(); return; }
+    if(!g_variant_iter_next(&it,"(u@a{sv})",&node,&props)){ vrlog("[portal] no stream\n"); cleanup_and_quit(); return; }
     if(props)g_variant_unref(props);
     /* pick succeeded -> now take the lease (so cancelling above caused no flash) */
     g_drmfd=wl_lease_acquire();
-    if(g_drmfd<0||present_up()<0){ fprintf(stderr,"[wl] lease/present failed (headset asleep?)\n"); cleanup_and_quit(); return; }
+    if(g_drmfd<0||present_up()<0){ vrlog("[wl] lease/present failed (headset asleep?)\n"); cleanup_and_quit(); return; }
     int fd=xdp_session_open_pipewire_remote(session);
     start_pipewire(fd,node);
     g_signal_connect(session,"closed",G_CALLBACK(on_closed),NULL);
     g_timeout_add(16,frame_cb,NULL);
-    printf("[vrmirror] mirroring. Stop from GNOME's top-bar share indicator.\n"); fflush(stdout);
+    vrlog("[vrmirror] mirroring. Stop from GNOME's top-bar share indicator.\n");
 }
 static void on_created(GObject*src,GAsyncResult*res,gpointer u){
     (void)u; XdpPortal*portal=XDP_PORTAL(src); GError*err=NULL;
     XdpSession*session=xdp_portal_create_screencast_session_finish(portal,res,&err);
-    if(!session){ fprintf(stderr,"[portal] create failed: %s\n",err?err->message:"?"); cleanup_and_quit(); return; }
+    if(!session){ vrlog("[portal] create failed: %s\n",err?err->message:"?"); cleanup_and_quit(); return; }
     xdp_session_start(session,NULL,NULL,on_started,NULL);
 }
 static gboolean on_signal(gpointer u){ (void)u; cleanup_and_quit(); return G_SOURCE_REMOVE; }
 
 int main(int argc,char**argv){
     if(argc>1) g_output=argv[1];
+    vrlog_open("vrmirror-wl");
     if(getenv("VRMIRROR_TEST")) g_test=1;   /* other VRMIRROR_* knobs: apply_present_env() */
     g_mutex_init(&g_lock);
     g_loop=g_main_loop_new(NULL,FALSE);
@@ -300,9 +315,9 @@ int main(int argc,char**argv){
     if(g_test){
         /* diagnostic: no portal, just lease + draw the centered crosshair */
         g_drmfd=wl_lease_acquire();
-        if(g_drmfd<0||present_up()<0){ fprintf(stderr,"[test] lease/present failed\n"); return 1; }
+        if(g_drmfd<0||present_up()<0){ vrlog("[test] lease/present failed\n"); return 1; }
         g_timeout_add(16,frame_cb,NULL);
-        printf("[test] crosshair on panel. Ctrl-C to stop.\n"); fflush(stdout);
+        vrlog("[test] crosshair on panel. Ctrl-C to stop.\n");
     } else {
         XdpPortal*portal=xdp_portal_new();
         xdp_portal_create_screencast_session(portal,
@@ -318,6 +333,7 @@ int main(int argc,char**argv){
     if(g_drmfd>=0){ close(g_drmfd); g_drmfd=-1; }
     if(g_lease_obj) wp_drm_lease_v1_destroy(g_lease_obj);
     if(g_wl){ wl_display_flush(g_wl); wl_display_disconnect(g_wl); }
-    printf("[vrmirror] exit (lease released)\n");
+    vrlog("[vrmirror] exit (lease released)");
+    vrlog_close();
     return 0;
 }

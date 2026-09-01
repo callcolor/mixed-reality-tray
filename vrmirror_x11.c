@@ -32,6 +32,7 @@
 #include <glib-unix.h>
 #include <libxapp/xapp-status-icon.h>
 #include "vrpresent.h"
+#include "vrlog.h"
 #include "vrhead.h"
 
 /* -------------------------- engine state (single process) --------------- */
@@ -53,13 +54,42 @@ static int      g_pw = 0, g_ph = 0;
 static uint8_t *g_frame = NULL;         /* packed BGRX capture, handed to the presenter */
 static size_t   g_framesz = 0;
 
-static const char *g_output = "DP-3-2";
+/* Connector to lease. NULL = auto-detect (see lease_acquire); argv[1] overrides.
+ * FALLBACK_OUTPUT is only tried if auto-detect finds nothing, so a kernel that
+ * doesn't flag the panel non-desktop still behaves as it did before. */
+#define FALLBACK_OUTPUT "DP-3-2"
+static const char *g_output = NULL;
+static char g_picked[128] = "";     /* output actually leased, for messages */
 static XAppStatusIcon *g_icon = NULL;
 
 /* ignore X errors from capturing windows that vanish/resize under us */
 static int xerr(Display *d, XErrorEvent *e){ (void)d;(void)e; return 0; }
 
 /* ------------------------------ lease grab ------------------------------ */
+/* The headset panel is flagged non-desktop by the kernel -- that is precisely
+ * why it is leasable and stays out of the desktop -- so with no output named on
+ * the command line we look for that property instead of a fixed name. A name
+ * like "DP-3-2" is an MST path: it differs per machine and even per port. */
+static xcb_atom_t nd_atom(void){
+    xcb_intern_atom_reply_t *r=
+        xcb_intern_atom_reply(g_xcb,xcb_intern_atom(g_xcb,1,11,"non-desktop"),NULL);
+    xcb_atom_t a=r?r->atom:XCB_ATOM_NONE;
+    free(r);
+    return a;
+}
+static int is_nondesktop(xcb_randr_output_t o, xcb_atom_t nd){
+    if(nd==XCB_ATOM_NONE) return 0;
+    xcb_randr_get_output_property_reply_t *pr=
+        xcb_randr_get_output_property_reply(g_xcb,
+            xcb_randr_get_output_property(g_xcb,o,nd,XCB_ATOM_INTEGER,0,1,0,0),NULL);
+    int v=0;
+    if(pr){
+        if(pr->format==32 && xcb_randr_get_output_property_data_length(pr)>=4)
+            v = *(int32_t*)xcb_randr_get_output_property_data(pr) != 0;
+        free(pr);
+    }
+    return v;
+}
 static int lease_acquire(void){
     int sp=0; g_xcb=xcb_connect(NULL,&sp);
     if(xcb_connection_has_error(g_xcb)) return -1;
@@ -71,20 +101,46 @@ static int lease_acquire(void){
     if(!res) return -1;
     xcb_randr_output_t *outs=xcb_randr_get_screen_resources_outputs(res);
     int nouts=xcb_randr_get_screen_resources_outputs_length(res);
+    xcb_atom_t nd = g_output ? XCB_ATOM_NONE : nd_atom();
     xcb_randr_output_t out=0; xcb_randr_crtc_t *poss=NULL; int nposs=0;
-    for(int i=0;i<nouts;i++){
-        xcb_randr_get_output_info_reply_t *oi=
-            xcb_randr_get_output_info_reply(g_xcb,xcb_randr_get_output_info(g_xcb,outs[i],res->config_timestamp),NULL);
-        if(!oi) continue;
-        int len=xcb_randr_get_output_info_name_length(oi); char nm[128]; int l=len<127?len:127;
-        memcpy(nm,xcb_randr_get_output_info_name(oi),l); nm[l]=0;
-        if(!strcmp(nm,g_output)){ out=outs[i]; nposs=xcb_randr_get_output_info_crtcs_length(oi);
-            poss=malloc(sizeof(xcb_randr_crtc_t)*nposs);
-            memcpy(poss,xcb_randr_get_output_info_crtcs(oi),sizeof(xcb_randr_crtc_t)*nposs);
-            free(oi); break; }
-        free(oi);
+    /* pass 0: the requested name, or any non-desktop output; pass 1 (auto only):
+     * the historical default name, as a no-regression fallback. */
+    const char *want=g_output;
+    for(int pass=0; pass<2 && !out; pass++){
+        if(pass==1){
+            if(g_output) break;
+            want=FALLBACK_OUTPUT; nd=XCB_ATOM_NONE;
+        }
+        for(int i=0;i<nouts;i++){
+            xcb_randr_get_output_info_reply_t *oi=
+                xcb_randr_get_output_info_reply(g_xcb,xcb_randr_get_output_info(g_xcb,outs[i],res->config_timestamp),NULL);
+            if(!oi) continue;
+            int len=xcb_randr_get_output_info_name_length(oi); char nm[128]; int l=len<127?len:127;
+            memcpy(nm,xcb_randr_get_output_info_name(oi),l); nm[l]=0;
+            int match = want ? !strcmp(nm,want) : is_nondesktop(outs[i],nd);
+            if(match && !out){
+                out=outs[i]; nposs=xcb_randr_get_output_info_crtcs_length(oi);
+                poss=malloc(sizeof(xcb_randr_crtc_t)*nposs);
+                memcpy(poss,xcb_randr_get_output_info_crtcs(oi),sizeof(xcb_randr_crtc_t)*nposs);
+                snprintf(g_picked,sizeof g_picked,"%s",nm);
+            } else if(match && !want){
+                vrlog("[x11] note: ignoring extra non-desktop output '%s' "
+                               "(pass it as an argument to use that one instead)\n",nm);
+            }
+            free(oi);
+            if(out && want) break;   /* named match is unambiguous; stop looking */
+        }
+        if(out && pass==1)
+            vrlog("[x11] no non-desktop output; fell back to '%s'\n",FALLBACK_OUTPUT);
     }
-    if(!out){ free(res); return -1; }
+    if(!out){
+        if(g_output)
+            vrlog("[x11] no RandR output named '%s' (%d outputs on this screen)\n",g_output,nouts);
+        else
+            vrlog("[x11] no non-desktop output found -- headset plugged in and awake? "
+                           "Run `xrandr --listmonitors`/`--props` and pass the output name as an argument.\n");
+        free(res); return -1;
+    }
     xcb_randr_crtc_t crtc=0;
     for(int i=0;i<nposs && !crtc;i++){
         xcb_randr_get_crtc_info_reply_t *ci=
@@ -94,15 +150,16 @@ static int lease_acquire(void){
         free(ci);
     }
     free(poss); free(res);
-    if(!crtc) return -1;
+    if(!crtc){ vrlog("[x11] output '%s' has no free CRTC to lease\n",g_picked); return -1; }
     g_lease=xcb_generate_id(g_xcb);
     xcb_generic_error_t *err=NULL;
     xcb_randr_create_lease_reply_t *lr=
         xcb_randr_create_lease_reply(g_xcb,xcb_randr_create_lease(g_xcb,root,g_lease,1,1,&crtc,&out),&err);
-    if(!lr||err) return -1;
+    if(!lr||err){ vrlog("[x11] CreateLease rejected for '%s'\n",g_picked); return -1; }
     int nfd=lr->nfd; int *fds=xcb_randr_create_lease_reply_fds(g_xcb,lr);
-    if(nfd<1) return -1;
+    if(nfd<1){ vrlog("[x11] lease returned no DRM fd\n"); return -1; }
     g_drmfd=fds[0];
+    vrlog("[x11] leased %s\n",g_picked);
     return 0;
 }
 static int lease_on(void){ return g_present!=NULL; }   /* headset lit */
@@ -255,7 +312,7 @@ static int ensure_enabled(void){
     icon_state(); return 0;
 }
 static void do_enable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
-    if(ensure_enabled()!=0) g_warning("enable failed (panel asleep? wear the headset)"); }
+    if(ensure_enabled()!=0) vrlog("[x11] enable failed (see the lines above for why)"); }
 static void do_disable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     g_target=0; if(g_pix){XFreePixmap(g_dpy,g_pix);g_pix=0;}
     if(g_drm_src){ g_source_remove(g_drm_src); g_drm_src=0; }
@@ -266,9 +323,9 @@ static void do_disable(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     if(g_frame_src){ g_source_remove(g_frame_src); g_frame_src=0; }
     icon_state(); }
 static void do_pick(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
-    if(ensure_enabled()!=0){ g_warning("cannot enable headset"); return; }
+    if(ensure_enabled()!=0){ vrlog("[x11] cannot enable headset"); return; }
     Window w=pick_window();
-    if(w){ set_target(w); printf("[x11] mirroring 0x%lx\n",w); }
+    if(w){ set_target(w); vrlog("[x11] mirroring 0x%lx\n",w); }
     icon_state(); }
 static void do_stop(GtkMenuItem*m,gpointer u){ (void)m;(void)u;
     g_target=0; if(g_pix){XFreePixmap(g_dpy,g_pix);g_pix=0;}
@@ -301,11 +358,12 @@ static gboolean on_signal(gpointer u){ (void)u; gtk_main_quit(); return G_SOURCE
 int main(int argc,char**argv){
     gtk_init(&argc,&argv);
     if(argc>1) g_output=argv[1];
+    vrlog_open("vrmirror-x11");
     XSetErrorHandler(xerr);
     g_dpy=XOpenDisplay(NULL);
-    if(!g_dpy){ fprintf(stderr,"cannot open X display\n"); return 1; }
+    if(!g_dpy){ vrlog("cannot open X display\n"); return 1; }
     g_root=DefaultRootWindow(g_dpy);
-    int evb,erb; if(!XCompositeQueryExtension(g_dpy,&evb,&erb)){ fprintf(stderr,"no XComposite\n"); return 1; }
+    int evb,erb; if(!XCompositeQueryExtension(g_dpy,&evb,&erb)){ vrlog("no XComposite\n"); return 1; }
 
     g_icon=xapp_status_icon_new();
     xapp_status_icon_set_name(g_icon,"vrmirror-x11");
@@ -317,7 +375,8 @@ int main(int argc,char**argv){
     g_unix_signal_add(SIGINT,on_signal,NULL);
     g_unix_signal_add(SIGTERM,on_signal,NULL);
 
-    printf("[x11] running (output %s). Use the tray menu.\n",g_output); fflush(stdout);
+    vrlog("[x11] running (output %s). Use the tray menu.\n",
+           g_output?g_output:"auto-detect");
     gtk_main();
 
     /* teardown: always release the lease */
@@ -329,6 +388,7 @@ int main(int argc,char**argv){
     if(g_present){ vr_present_destroy(g_present); g_present=NULL; }
     if(g_drmfd>=0) lease_release();
     XCloseDisplay(g_dpy);
-    printf("[x11] exit (lease released)\n");
+    vrlog("[x11] exit (lease released)");
+    vrlog_close();
     return 0;
 }

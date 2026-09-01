@@ -40,6 +40,12 @@ Common to both:
 
     make wayland-mirror    # builds ./vrmirror-wl (needs wayland-scanner)
 
+    make install           # ~/.local/bin + a menu entry (PREFIX= to relocate)
+
+`make install` puts whichever frontends you built on `PATH` and installs their
+`.desktop` launchers, so vrmirror can be started from the applications menu
+rather than a terminal. `make uninstall` reverses it.
+
 Then use the tray icon:
 
 | Menu item        | Effect |
@@ -82,10 +88,30 @@ Axis mapping and signs (`VRMIRROR_HEAD_YAW_AXIS` / `_PITCH_AXIS` / `_YAW_SIGN` /
 `_PITCH_SIGN`) default to the measured Acer AH101 layout; override if your headset's
 gyro is oriented differently.
 
+## Logs
+
+Every diagnostic line goes to both stderr and a log file, so a run started from
+the applications menu — with no terminal to read — still leaves something to send:
+
+    ~/.local/state/vrmirror/vrmirror-x11.log     (or vrmirror-wl.log)
+
+The previous run is kept alongside it as `.log.1`; each launch rotates. Lines are
+timestamped to the millisecond and flushed as they are written, so the log survives
+a hard failure mid-lease. Each file opens with a header identifying the build and
+the machine — version, kernel, distro, session type, every GPU with its driver, and
+any `VRMIRROR_*` overrides in effect. **That header plus the lease/present lines
+under it is what to attach to a bug report.** Only `VRMIRROR_*` variables are
+recorded, never the rest of the environment.
+
 ## Notes / current limits
 
-- **Output name.** The X11 frontend defaults to output `DP-3-2`; pass another as
-  `./vrmirror-x11 <OUTPUT>`. (The Wayland frontend defaults to `DP-7`.)
+- **Output name.** Auto-detected — the headset panel is the one connector the kernel
+  flags *non-desktop*, which is exactly why it is leasable. `vrmirror-x11` scans RandR
+  for that property; `vrmirror-wl` takes the connectors `wp_drm_lease` offers, which the
+  compositor already filters to non-desktop ones. Pass a name to override
+  (`./vrmirror-x11 DP-3-2`, `./vrmirror-wl DP-7`) — note the two desktops name the same
+  physical panel differently. If no non-desktop output turns up, the X11 frontend falls
+  back to `DP-3-2`.
 - **No lens distortion yet.** The image is scanned out flat to each eye; per-eye lens
   distortion is the next step (the presenter already isolates the per-eye seam for it).
 - **Gyro drift.** With recenter off (the default), "straight ahead" can wander a few

@@ -14,6 +14,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include "vrpresent.h"
+#include "vrlog.h"
 
 #ifndef DRM_PLANE_TYPE_PRIMARY
 #define DRM_PLANE_TYPE_PRIMARY 1
@@ -114,13 +115,13 @@ vr_present *vr_present_create(int drmfd){
     p->smode = VR_STEREO_MONO; p->scand = VR_STEREO_MONO; p->sagree = SWITCH_AFTER;
 
     drmSetClientCap(drmfd,DRM_CLIENT_CAP_UNIVERSAL_PLANES,1);
-    if(drmSetClientCap(drmfd,DRM_CLIENT_CAP_ATOMIC,1)){ fprintf(stderr,"[present] atomic cap unsupported\n"); goto fail; }
+    if(drmSetClientCap(drmfd,DRM_CLIENT_CAP_ATOMIC,1)){ vrlog("[present] atomic cap unsupported\n"); goto fail; }
     drmModeRes *dr = drmModeGetResources(drmfd);
-    if(!dr){ fprintf(stderr,"[present] GetResources NULL\n"); goto fail; }
+    if(!dr){ vrlog("[present] GetResources NULL\n"); goto fail; }
     if(dr->count_connectors<1 || dr->count_crtcs<1){ drmModeFreeResources(dr); goto fail; }
     p->conn_id = dr->connectors[0]; p->crtc_id = dr->crtcs[0];
     drmModeConnector *c = drmModeGetConnector(drmfd,p->conn_id);
-    if(!c || c->count_modes<1){ if(c)drmModeFreeConnector(c); drmModeFreeResources(dr); fprintf(stderr,"[present] no modes (panel asleep? wear the headset)\n"); goto fail; }
+    if(!c || c->count_modes<1){ if(c)drmModeFreeConnector(c); drmModeFreeResources(dr); vrlog("[present] no modes (panel asleep? wear the headset)\n"); goto fail; }
     int best=0;   /* largest area, highest refresh on ties (native 2880x1440@90) */
     for(int m=1;m<c->count_modes;m++){
         long a=(long)c->modes[m].hdisplay*c->modes[m].vdisplay, ab=(long)c->modes[best].hdisplay*c->modes[best].vdisplay;
@@ -128,8 +129,8 @@ vr_present *vr_present_create(int drmfd){
     }
     p->mode = c->modes[best]; drmModeFreeConnector(c); drmModeFreeResources(dr);
     int W=p->mode.hdisplay, H=p->mode.vdisplay;
-    if(mk_fb(drmfd,W,H,&p->fb[0]) || mk_fb(drmfd,W,H,&p->fb[1])){ fprintf(stderr,"[present] fb alloc failed\n"); goto fail; }
-    if(find_primary_plane(drmfd,&p->plane_id)){ fprintf(stderr,"[present] no primary plane for crtc\n"); goto fail; }
+    if(mk_fb(drmfd,W,H,&p->fb[0]) || mk_fb(drmfd,W,H,&p->fb[1])){ vrlog("[present] fb alloc failed\n"); goto fail; }
+    if(find_primary_plane(drmfd,&p->plane_id)){ vrlog("[present] no primary plane for crtc\n"); goto fail; }
     p->P_fb=prop_get(drmfd,p->plane_id,DRM_MODE_OBJECT_PLANE,"FB_ID",0);
     p->P_pcrtc=prop_get(drmfd,p->plane_id,DRM_MODE_OBJECT_PLANE,"CRTC_ID",0);
     p->P_sx=prop_get(drmfd,p->plane_id,DRM_MODE_OBJECT_PLANE,"SRC_X",0);
@@ -143,7 +144,7 @@ vr_present *vr_present_create(int drmfd){
     p->P_mode=prop_get(drmfd,p->crtc_id,DRM_MODE_OBJECT_CRTC,"MODE_ID",0);
     p->P_active=prop_get(drmfd,p->crtc_id,DRM_MODE_OBJECT_CRTC,"ACTIVE",0);
     p->P_conn_crtc=prop_get(drmfd,p->conn_id,DRM_MODE_OBJECT_CONNECTOR,"CRTC_ID",0);
-    if(!p->P_fb||!p->P_pcrtc||!p->P_mode||!p->P_active||!p->P_conn_crtc){ fprintf(stderr,"[present] missing atomic props\n"); goto fail; }
+    if(!p->P_fb||!p->P_pcrtc||!p->P_mode||!p->P_active||!p->P_conn_crtc){ vrlog("[present] missing atomic props\n"); goto fail; }
     drmModeCreatePropertyBlob(drmfd,&p->mode,sizeof p->mode,&p->mode_blob);
     drmModeAtomicReq *req = drmModeAtomicAlloc();
     drmModeAtomicAddProperty(req,p->conn_id,p->P_conn_crtc,p->crtc_id);
@@ -152,14 +153,14 @@ vr_present *vr_present_create(int drmfd){
     plane_full(p,req,p->fb[0].fb_id,W,H);
     int r = drmModeAtomicCommit(drmfd,req,DRM_MODE_ATOMIC_ALLOW_MODESET,NULL);
     drmModeAtomicFree(req);
-    if(r){ fprintf(stderr,"[present] atomic modeset failed: %s\n",strerror(errno)); goto fail; }
+    if(r){ vrlog("[present] atomic modeset failed: %s\n",strerror(errno)); goto fail; }
 
     /* THE fix for the early flashing: kill any stray cursor overlay left on the
      * leased CRTC. Nothing else programs a cursor plane, so this stays off. */
     drmModeSetCursor(drmfd,p->crtc_id,0,0,0);
 
     p->front=0; p->flip_pending=0;
-    printf("[present] panel %dx%d@%dHz lit (atomic, plane %u)\n",W,H,p->mode.vrefresh,p->plane_id); fflush(stdout);
+    vrlog("[present] panel %dx%d@%dHz lit (atomic, plane %u)\n",W,H,p->mode.vrefresh,p->plane_id);
     return p;
 fail:
     vr_present_destroy(p);
@@ -286,7 +287,7 @@ static void composite_and_flip(vr_present *p, const uint8_t *L, const uint8_t *R
     for(int y=0;y<H;y++){ uint8_t *d=base+(size_t)y*pitch;
         memcpy(d, L+(size_t)y*es, es); memcpy(d+es, R+(size_t)y*es, es); }
     if(present_flip(p,back)==0){ p->flip_pending=1; p->front=back; }
-    else { static int warned=0; if(!warned){warned=1; fprintf(stderr,"[present] atomic flip failed: %s\n",strerror(errno)); } }
+    else { static int warned=0; if(!warned){warned=1; vrlog("[present] atomic flip failed: %s\n",strerror(errno)); } }
 }
 
 void vr_present_frame(vr_present *p, const uint8_t *bgrx, int w, int h, size_t stride){
@@ -320,7 +321,7 @@ void vr_present_frame(vr_present *p, const uint8_t *bgrx, int w, int h, size_t s
         if(nm==p->scand) p->sagree++; else { p->scand=nm; p->sagree=1; }
         if(p->sagree>=SWITCH_AFTER && p->smode!=p->scand){
             p->smode=p->scand;
-            fprintf(stderr,"[stereo] -> %s (lr=%.2f tb=%.2f rep=%.2f)\n",
+            vrlog("[stereo] -> %s (lr=%.2f tb=%.2f rep=%.2f)\n",
                 p->smode==VR_STEREO_SBS?"SBS":p->smode==VR_STEREO_OU?"OU":"2D",lr,tb,rep); fflush(stderr);
         }
     }
